@@ -1,4 +1,5 @@
 #pragma config(I2C_Usage, I2C1, i2cSensors)
+#pragma config(Sensor, in1,    zoom,           sensorAccelerometer)
 #pragma config(Sensor, dgtl1,  Eye1,           sensorSONAR_cm)
 #pragma config(Sensor, dgtl5,  Eye3,           sensorSONAR_cm)
 #pragma config(Sensor, dgtl7,  Eye2,           sensorSONAR_cm)
@@ -15,6 +16,31 @@
 #define HISTORY 5
 #define ENCODER_RANGE 300
 #define SCAN_RANGE 250
+
+#define SAFE 30
+#define BUMP 30
+
+// High-pass filter
+// y[t] = alpha * (y[t-1] + x[t] - x[t-1])
+
+struct HPF {
+  float x;
+  float y;
+  float alpha;
+};
+
+void HPFinit(HPF* hpf, float alpha) {
+  hpf->x = 0.0;
+  hpf->y = 0.0;
+  hpf->alpha = alpha;
+}
+
+float HPFupdate(HPF* hpf, float x) {
+  hpf->y = hpf->alpha * (hpf->y + x - hpf->x);
+  hpf->x = x;
+
+  return hpf->y;
+}
 
 enum Direction {
 	DIR_E = 0,  // 0 deg
@@ -104,11 +130,10 @@ Direction angleToDir(int angle) {
 }
 
 World w;
+bool hit = false;
 
 task displayMap() {
 	while (true) {
-//		writeDebugStreamLine("1=%d 2=%d 3=%d\n", SensorValue[Eye1], SensorValue[Eye2], SensorValue[Eye3]);
-
 		writeDebugStreamLine("| %.03d | %.03d | %.03d |", getDistance(&w, DIR_NW), getDistance(&w, DIR_N), getDistance(&w, DIR_NE));
 		writeDebugStreamLine("| %.03d |     | %.03d |", getDistance(&w, DIR_W),  getDistance(&w, DIR_E));
 		writeDebugStreamLine("| %.03d | %.03d | %.03d |", getDistance(&w, DIR_SW), getDistance(&w, DIR_S), getDistance(&w, DIR_SE));
@@ -124,9 +149,22 @@ task measure() {
 	int last_angle = -1000;  // ensure we read the first values
 
 	int sign = +1;
+  HPF bumper;
+  HPFinit(&bumper, 0.05);
+  int hittime = time1[T4];
 
 	while (true) {
-  	motor[Spinner] = 30 * sign;
+		int acc = HPFupdate(&bumper, SensorValue[zoom]);
+    if (abs(acc) > BUMP) {
+    	hit = true;
+    	hittime = time1[T4];
+		  writeDebugStreamLine("HIT=%d", acc);
+	  }
+	  if (time1[T4] > hittime + 1000) {
+	  	hit = false;
+	  }
+
+  	motor[Spinner] = 40 * sign;
 
 		// encoder will cover +/- ENCODER_RANGE, which we map
 	  // to 0 - 360 degrees.
@@ -163,41 +201,60 @@ enum State {
   STATE_FORWARD = 0,
   STATE_TURN_LEFT = 1,
   STATE_TURN_RIGHT = 2,
+  STATE_BACK_OUT = 3,
 };
 
-#define SAFE 35
 
 task main()
 {
+	wait(2);  // initialize the accelerometer
+
 	startTask(measure);
 	startTask(displayMap);
 
+	int fwd_start = time1[T3];
   State s = STATE_FORWARD;
   while (true) {
     switch (s) {
       case STATE_FORWARD:
+        if (hit && time1[T3] > fwd_start + 1000) s = STATE_BACK_OUT;
         drive(70, 70);
         if (getDistance(&w, DIR_E) < SAFE ||
-        	  getDistance(&w, DIR_NE) < SAFE ||
-        	  getDistance(&w, DIR_SE) < SAFE) {
+        	  getDistance(&w, DIR_NE) < (SAFE+10) ||
+        	  getDistance(&w, DIR_SE) < (SAFE+10)) {
         	 s = getDistance(&w, DIR_N) > getDistance(&w, DIR_S) ? STATE_TURN_LEFT : STATE_TURN_RIGHT;
         }
         break;
       case STATE_TURN_LEFT:
         drive(-40, +40);
         if (getDistance(&w, DIR_E) > SAFE &&
-        	  getDistance(&w, DIR_NE) > SAFE &&
-        	  getDistance(&w, DIR_SE) > SAFE) {
+        	  getDistance(&w, DIR_NE) > (SAFE+10) &&
+        	  getDistance(&w, DIR_SE) > (SAFE+10)) {
           s = STATE_FORWARD;
+          fwd_start = time1[T3];
+        } else {
+          if (hit) s = STATE_BACK_OUT;
         }
         break;
       case STATE_TURN_RIGHT:
         drive(+40, -40);
-        if (getDistance(&w, DIR_E) > SAFE &&
-        	  getDistance(&w, DIR_NE) > SAFE &&
-        	  getDistance(&w, DIR_SE) > SAFE) {
+        if (getDistance(&w, DIR_E) > (SAFE+5) &&
+        	  getDistance(&w, DIR_NE) > (SAFE+5) &&
+        	  getDistance(&w, DIR_SE) > (SAFE+5)) {
           s = STATE_FORWARD;
+          fwd_start = time1[T3];
+        } else {
+          if (hit) s = STATE_BACK_OUT;
         }
+        break;
+      case STATE_BACK_OUT:
+        drive(-30, -30);
+        wait1Msec(1000);
+        int turn = getDistance(&w, DIR_N) > getDistance(&w, DIR_S) ? -40 : 40;
+        drive(turn, -turn);
+        wait1Msec(1000);
+        s = STATE_FORWARD;
+        fwd_start = time1[T3];
         break;
     }
   }
